@@ -1,0 +1,452 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  signInAnonymously, 
+  onAuthStateChanged,
+  signOut,
+  GoogleAuthProvider,
+  signInWithPopup
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  addDoc, 
+  query, 
+  onSnapshot, 
+  serverTimestamp,
+  orderBy,
+  deleteDoc,
+  doc,
+  getDocs,
+  where
+} from 'firebase/firestore';
+import { 
+  Mic, 
+  MicOff, 
+  Send, 
+  LogOut, 
+  Clock, 
+  Type, 
+  User, 
+  CheckCircle2,
+  Lightbulb,
+  Calendar,
+  TrendingUp,
+  BookOpen,
+  Filter,
+  Trash2,
+  AlertCircle,
+  ExternalLink
+} from 'lucide-react';
+
+// Firebase configuration from environment
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'focus-memo-default';
+
+const CATEGORIES = [
+  { id: 'idea', label: '아이디어', icon: <Lightbulb size={14} />, color: 'text-yellow-400', bg: 'bg-yellow-400/10' },
+  { id: 'schedule', label: '일정', icon: <Calendar size={14} />, color: 'text-blue-400', bg: 'bg-blue-400/10' },
+  { id: 'mindset', label: '부자마인드', icon: <TrendingUp size={14} />, color: 'text-green-400', bg: 'bg-green-400/10' },
+  { id: 'reading', label: '독서기록', icon: <BookOpen size={14} />, color: 'text-purple-400', bg: 'bg-purple-400/10' },
+];
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [memos, setMemos] = useState([]);
+  const [inputText, setInputText] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('idea');
+  const [filterCategory, setFilterCategory] = useState('all');
+  const [isListening, setIsListening] = useState(false);
+  const [snackbar, setSnackbar] = useState({ show: false, message: '', type: 'success' });
+  const [showAuthError, setShowAuthError] = useState(false);
+  const recognitionRef = useRef(null);
+  const isSigningIn = useRef(false);
+
+  // 1. Authentication Setup (Rule 3)
+  useEffect(() => {
+    const initAuth = async () => {
+      if (isSigningIn.current) return;
+      isSigningIn.current = true;
+      
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          // 기본적으로 익명 로그인을 시도하여 앱 기능을 즉시 사용 가능하게 함
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth initialization error:", error);
+      } finally {
+        isSigningIn.current = false;
+      }
+    };
+
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Data Syncing (Rule 1 & 2)
+  useEffect(() => {
+    if (!user) return;
+
+    // Rule 1: Strict Paths
+    const memosRef = collection(db, 'artifacts', appId, 'public', 'data', 'memos');
+    const q = query(memosRef);
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const memoList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }))
+      // Rule 2: Fetch all then filter in memory to avoid index requirements
+      .filter(m => m.userId === user.uid) 
+      .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+      
+      setMemos(memoList);
+    }, (error) => {
+      console.error("Firestore error:", error);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Speech Recognition Setup
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = false;
+      recognitionRef.current.interimResults = false;
+      recognitionRef.current.lang = 'ko-KR';
+
+      recognitionRef.current.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        saveMemo(transcript, 'Voice', selectedCategory);
+        setIsListening(false);
+      };
+
+      recognitionRef.current.onerror = () => {
+        setIsListening(false);
+        showSnackbar('음성 인식 중 오류가 발생했습니다.', 'error');
+      };
+
+      recognitionRef.current.onend = () => setIsListening(false);
+    }
+  }, [selectedCategory]);
+
+  const showSnackbar = (message, type = 'success') => {
+    setSnackbar({ show: true, message, type });
+    setTimeout(() => setSnackbar({ show: false, message: '', type: 'success' }), 3000);
+  };
+
+  const handleGoogleLogin = async () => {
+    if (isSigningIn.current) return;
+    isSigningIn.current = true;
+    setShowAuthError(false);
+    
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+      showSnackbar('구글 계정으로 연결되었습니다.');
+    } catch (error) {
+      console.error("Login failed:", error);
+      if (error.code === 'auth/unauthorized-domain') {
+        setShowAuthError(true);
+      } else {
+        showSnackbar('로그인 실패: ' + error.message, 'error');
+      }
+    } finally {
+      isSigningIn.current = false;
+    }
+  };
+
+  const saveMemo = async (text, type = 'Keyboard', categoryId = selectedCategory) => {
+    if (!text.trim() || !user) return;
+
+    try {
+      const memosRef = collection(db, 'artifacts', appId, 'public', 'data', 'memos');
+      await addDoc(memosRef, {
+        userId: user.uid,
+        userName: user.displayName || '익명 사용자',
+        content: text,
+        inputType: type,
+        categoryId: categoryId,
+        createdAt: serverTimestamp(),
+      });
+      
+      setInputText('');
+      showSnackbar('기록 완료');
+    } catch (error) {
+      console.error("Save error:", error);
+      showSnackbar('저장 실패', 'error');
+    }
+  };
+
+  const deleteMemo = async (memoId) => {
+    try {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'memos', memoId));
+      showSnackbar('삭제 완료');
+    } catch (error) {
+      console.error("Delete error:", error);
+      showSnackbar('삭제 실패', 'error');
+    }
+  };
+
+  const toggleListening = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+    } else {
+      if (!recognitionRef.current) {
+        showSnackbar('음성 인식을 지원하지 않는 브라우저입니다.', 'error');
+        return;
+      }
+      setIsListening(true);
+      recognitionRef.current.start();
+    }
+  };
+
+  const formatDate = (timestamp) => {
+    if (!timestamp) return '방금 전';
+    const date = timestamp.toDate();
+    return date.toLocaleString('ko-KR', { 
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
+    });
+  };
+
+  const filteredMemos = filterCategory === 'all' 
+    ? memos 
+    : memos.filter(m => m.categoryId === filterCategory);
+
+  const getCategoryInfo = (id) => CATEGORIES.find(c => c.id === id) || CATEGORIES[0];
+
+  return (
+    <div className="min-h-screen bg-[#0a0a0a] text-gray-100 flex flex-col font-sans selection:bg-indigo-500/30">
+      {/* Header */}
+      <header className="p-4 border-b border-white/5 flex justify-between items-center bg-[#111]/80 backdrop-blur-md sticky top-0 z-40">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+            <Type size={20} className="text-white" />
+          </div>
+          <div>
+            <h1 className="text-lg font-bold tracking-tight leading-none">Focus Memo</h1>
+            <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-widest font-medium">Deep Work Assistant</p>
+          </div>
+        </div>
+        
+        {user && !user.isAnonymous ? (
+          <div className="flex items-center gap-3">
+            <div className="text-right hidden sm:block">
+              <p className="text-xs font-bold text-gray-200">{user.displayName || '사용자'}</p>
+              <div className="flex items-center justify-end gap-1">
+                <div className="w-1 h-1 bg-green-500 rounded-full animate-pulse"></div>
+                <p className="text-[9px] text-gray-500 uppercase font-bold">Synced</p>
+              </div>
+            </div>
+            <button onClick={() => signOut(auth)} className="p-2.5 bg-white/5 hover:bg-red-500/10 rounded-full transition-all group border border-white/5">
+              <LogOut size={18} className="text-gray-400 group-hover:text-red-400" />
+            </button>
+          </div>
+        ) : (
+          <button 
+            onClick={handleGoogleLogin} 
+            className="group flex items-center gap-2 bg-white text-black px-5 py-2.5 rounded-full text-xs font-bold hover:bg-gray-200 transition-all shadow-xl active:scale-95"
+          >
+            <User size={14} />
+            Connect Google
+          </button>
+        )}
+      </header>
+
+      {/* Unauthorized Domain Error Message */}
+      {showAuthError && (
+        <div className="m-4 p-4 bg-red-500/10 border border-red-500/20 rounded-2xl flex flex-col gap-3 animate-in fade-in slide-in-from-top-2">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="text-red-400 shrink-0 mt-0.5" size={18} />
+            <div className="space-y-1">
+              <p className="text-sm font-bold text-red-100">도메인 인증 에러 발생</p>
+              <p className="text-xs text-red-200/70 leading-relaxed">
+                현재 실행 도메인이 Firebase에 등록되어 있지 않습니다. <br/>
+                에러 창에 뜬 도메인 주소를 복사하여 Firebase 콘솔의 <strong>'Authentication &gt; Settings &gt; Authorized domains'</strong>에 추가해 주세요.
+              </p>
+            </div>
+          </div>
+          <button 
+            onClick={() => window.open('https://console.firebase.google.com/', '_blank')}
+            className="flex items-center justify-center gap-2 bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[11px] font-bold py-2 rounded-xl transition-all"
+          >
+            <ExternalLink size={12} />
+            Firebase 콘솔로 이동하기
+          </button>
+        </div>
+      )}
+
+      {/* Status Bar */}
+      {user?.isAnonymous && !showAuthError && (
+        <div className="px-4 py-2 bg-indigo-500/10 border-b border-indigo-500/10 flex items-center justify-center gap-2">
+          <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-pulse"></div>
+          <p className="text-[10px] text-indigo-300 font-medium">
+            임시 세션으로 기록 중입니다. 기기 간 동기화를 위해 로그인이 필요합니다.
+          </p>
+        </div>
+      )}
+
+      {/* Category Filter Tabs */}
+      <div className="bg-[#111] border-b border-white/5 px-4 py-4 sticky top-[73px] z-30 overflow-x-auto no-scrollbar">
+        <div className="flex gap-2 max-w-2xl mx-auto">
+          <button
+            onClick={() => setFilterCategory('all')}
+            className={`px-5 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all ${
+              filterCategory === 'all' 
+                ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' 
+                : 'bg-white/5 text-gray-500 hover:bg-white/10'
+            }`}
+          >
+            모든 기록
+          </button>
+          {CATEGORIES.map(cat => (
+            <button
+              key={cat.id}
+              onClick={() => setFilterCategory(cat.id)}
+              className={`px-5 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all flex items-center gap-2 ${
+                filterCategory === cat.id 
+                  ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' 
+                  : 'bg-white/5 text-gray-500 hover:bg-white/10'
+              }`}
+            >
+              <span className={filterCategory === cat.id ? 'text-white' : cat.color}>{cat.icon}</span>
+              {cat.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main List */}
+      <main className="flex-1 overflow-y-auto p-4 max-w-2xl mx-auto w-full space-y-4 pb-52">
+        {filteredMemos.length === 0 ? (
+          <div className="h-80 flex flex-col items-center justify-center text-gray-700 space-y-4">
+            <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center border border-white/5">
+              <Filter size={32} strokeWidth={1} />
+            </div>
+            <div className="text-center">
+              <p className="text-sm font-medium">검색된 메모가 없습니다.</p>
+              <p className="text-xs text-gray-800 mt-1 uppercase tracking-tighter">Your mind is clear</p>
+            </div>
+          </div>
+        ) : (
+          filteredMemos.map((memo) => {
+            const cat = getCategoryInfo(memo.categoryId);
+            return (
+              <div key={memo.id} className="group bg-[#161616] border border-white/5 p-6 rounded-3xl shadow-sm hover:border-white/10 hover:bg-[#1a1a1a] transition-all relative">
+                <div className="flex justify-between items-start mb-4">
+                  <div className="flex gap-2 items-center">
+                    <span className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-tight ${cat.bg} ${cat.color}`}>
+                      {cat.icon}
+                      {cat.label}
+                    </span>
+                    <span className="text-[9px] bg-white/5 text-gray-500 px-2 py-1.5 rounded-lg font-bold uppercase tracking-widest">{memo.inputType}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-gray-600 flex items-center gap-1.5 font-medium">
+                      <Clock size={12} className="opacity-50" />
+                      {formatDate(memo.createdAt)}
+                    </span>
+                    <button 
+                      onClick={() => deleteMemo(memo.id)}
+                      className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-1 hover:scale-110 active:scale-90"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </div>
+                <p className="text-gray-300 text-[15px] leading-relaxed whitespace-pre-wrap font-medium">{memo.content}</p>
+              </div>
+            );
+          })
+        )}
+      </main>
+
+      {/* Persistent Input UI */}
+      <div className="fixed bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#0a0a0a] via-[#0a0a0a]/95 to-transparent z-40">
+        <div className="max-w-2xl mx-auto space-y-4">
+          {/* Category Selector */}
+          <div className="flex gap-2 overflow-x-auto no-scrollbar py-1">
+            {CATEGORIES.map(cat => (
+              <button
+                key={cat.id}
+                onClick={() => setSelectedCategory(cat.id)}
+                className={`px-4 py-2.5 rounded-2xl text-[11px] font-black flex items-center gap-2 transition-all border shrink-0 ${
+                  selectedCategory === cat.id 
+                    ? `bg-white ${cat.color} border-white shadow-xl shadow-white/5` 
+                    : 'bg-[#1a1a1a] text-gray-500 border-white/5 hover:bg-white/5'
+                }`}
+              >
+                {cat.icon}
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Input Box */}
+          <div className="bg-[#1a1a1a] border border-white/5 rounded-[32px] shadow-2xl p-2.5 flex items-center gap-3 focus-within:border-indigo-500/50 focus-within:bg-[#222] transition-all ring-4 ring-black/50">
+            <button 
+              onClick={toggleListening}
+              className={`p-4.5 rounded-[24px] transition-all group active:scale-95 ${
+                isListening ? 'bg-red-500 text-white animate-pulse shadow-lg shadow-red-500/30' : 'bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              {isListening ? <MicOff size={24} /> : <Mic size={24} />}
+            </button>
+            
+            <input 
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && saveMemo(inputText)}
+              placeholder={isListening ? "듣고 있습니다..." : `${getCategoryInfo(selectedCategory).label}에 대한 생각 기록...`}
+              className="flex-1 bg-transparent border-none focus:ring-0 text-white placeholder-gray-600 py-4 px-2 text-base font-medium"
+            />
+            
+            <button 
+              onClick={() => saveMemo(inputText)}
+              disabled={!inputText.trim()}
+              className={`p-4.5 rounded-[24px] transition-all active:scale-90 ${
+                inputText.trim() ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-gray-700'
+              }`}
+            >
+              <Send size={24} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Snackbar */}
+      {snackbar.show && (
+        <div className="fixed bottom-36 left-1/2 -translate-x-1/2 z-50 animate-in fade-in zoom-in slide-in-from-bottom-6">
+          <div className={`backdrop-blur-xl px-8 py-4 rounded-3xl shadow-2xl flex items-center gap-4 border ${
+            snackbar.type === 'error' ? 'bg-red-900/90 text-red-100 border-red-500/30' : 'bg-white/10 text-white border-white/10'
+          }`}>
+            {snackbar.type === 'error' ? (
+              <AlertCircle size={18} className="text-red-400" />
+            ) : (
+              <div className="w-5 h-5 bg-green-500 rounded-full flex items-center justify-center">
+                <CheckCircle2 size={12} className="text-white" />
+              </div>
+            )}
+            <span className="text-sm font-bold tracking-tight">{snackbar.message}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
